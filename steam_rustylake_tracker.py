@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopenc
+from urllib.request import Request, urlopen
 
 
 DEFAULT_BUNDLE_ID = "3669"
