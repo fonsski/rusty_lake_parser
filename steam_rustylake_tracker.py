@@ -354,6 +354,9 @@ def run(force_notify: bool, send_test_message: bool) -> int:
     token = require_env("TELEGRAM_BOT_TOKEN")
     chat_id = require_env("TELEGRAM_CHAT_ID")
     store_url = build_store_url(bundle_id, steam_cc, steam_lang)
+    # Steam localizes bundle labels, but the parser below relies on the stable
+    # English purchase labels ("Your cost", "Bundle discount", etc.).
+    parse_store_url = build_store_url(bundle_id, steam_cc, "english")
     state = load_state(state_path)
 
     if send_test_message:
@@ -371,7 +374,7 @@ def run(force_notify: bool, send_test_message: bool) -> int:
         return 0
 
     try:
-        html = fetch_html(store_url, timeout)
+        html = fetch_html(parse_store_url, timeout)
         current = parse_bundle_snapshot(bundle_id, bundle_name, store_url, html)
     except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
         error_text = f"{type(exc).__name__}: {exc}"
