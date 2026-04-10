@@ -34,6 +34,7 @@ PRICE_RE = re.compile(
     r"\d[\d.,\s\u00a0\u202f']*\s*[A-Za-z$€£¥₽₴₸₹₺₫₱₦]+)"
 )
 DISCOUNT_RE = re.compile(r"-?\d+%")
+TAG_STRIP_RE = re.compile(r"<[^>]+>")
 
 
 class TextExtractor(HTMLParser):
@@ -198,6 +199,34 @@ def extract_purchase_offer(lines: list[str], bundle_name: str) -> tuple[str | No
     return None, 0
 
 
+def clean_html_text(value: str) -> str:
+    return normalize_space(TAG_STRIP_RE.sub(" ", value))
+
+
+def extract_structured_bundle_pricing(html: str) -> tuple[str | None, str | None, int]:
+    current_match = re.search(
+        r'class="price bundle_final_price_with_discount">(.+?)</div>',
+        html,
+        re.IGNORECASE | re.DOTALL,
+    )
+    original_match = re.search(
+        r'class="price bundle_final_package_price">(.+?)</div>',
+        html,
+        re.IGNORECASE | re.DOTALL,
+    )
+    discount_match = re.search(
+        r'class="price bundle_discount">(.+?)</div>',
+        html,
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    current_price = clean_html_text(current_match.group(1)) if current_match else None
+    original_price = clean_html_text(original_match.group(1)) if original_match else None
+    discount_percent = parse_discount_percent(discount_match.group(1)) if discount_match else 0
+
+    return current_price, original_price, discount_percent
+
+
 def parse_discount_percent(value: str | None) -> int:
     if not value:
         return 0
@@ -208,22 +237,30 @@ def parse_discount_percent(value: str | None) -> int:
 
 
 def parse_bundle_snapshot(bundle_id: str, bundle_name: str, store_url: str, html: str) -> BundleSnapshot:
+    current_price, original_price, discount_percent = extract_structured_bundle_pricing(html)
+
     extractor = TextExtractor()
     extractor.feed(html)
     lines = extractor.lines()
 
-    current_price, purchase_discount = extract_purchase_offer(lines, bundle_name)
     if current_price is None:
-        current_price = extract_value_before_label(lines, "Your cost:", PRICE_RE)
-    original_price = extract_value_before_label(lines, "Price of individual products:", PRICE_RE)
-    discount_text = extract_value_before_label(lines, "Bundle discount:", DISCOUNT_RE)
+        current_price, purchase_discount = extract_purchase_offer(lines, bundle_name)
+        if current_price is None:
+            current_price = extract_value_before_label(lines, "Your cost:", PRICE_RE)
+    else:
+        purchase_discount = discount_percent
+
+    if original_price is None:
+        original_price = extract_value_before_label(lines, "Price of individual products:", PRICE_RE)
+
+    if discount_percent == 0:
+        discount_text = extract_value_before_label(lines, "Bundle discount:", DISCOUNT_RE)
+        discount_percent = max(purchase_discount, parse_discount_percent(discount_text))
 
     if current_price is None:
         current_price = extract_first_price(lines)
     if current_price is None:
         raise ValueError("Failed to parse the current bundle price from Steam page.")
-
-    discount_percent = max(purchase_discount, parse_discount_percent(discount_text))
 
     if original_price is None and discount_percent == 0:
         original_price = current_price
