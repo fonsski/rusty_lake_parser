@@ -7,6 +7,7 @@ import os
 import re
 import sys
 from dataclasses import asdict, dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timezone
 from html import escape
 from html.parser import HTMLParser
@@ -15,6 +16,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from xml.etree import ElementTree
 
 
 DEFAULT_BUNDLE_ID = "3669"
@@ -24,6 +26,7 @@ DEFAULT_STEAM_LANG = "english"
 DEFAULT_TIMEOUT = 20
 DEFAULT_STATE_FILE = "data/rustylake_state.json"
 DEFAULT_MIN_DISCOUNT_PERCENT = 50
+CBR_DAILY_RATES_URL = "https://www.cbr.ru/scripts/XML_daily.asp"
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
@@ -118,6 +121,17 @@ def require_env(name: str) -> str:
     return value
 
 
+def parse_decimal_env(name: str) -> Decimal | None:
+    value = env(name)
+    if not value:
+        return None
+    normalized = value.strip().replace(",", ".")
+    try:
+        return Decimal(normalized)
+    except InvalidOperation as exc:
+        raise ValueError(f"Invalid decimal value for {name}: {value}") from exc
+
+
 def build_store_url(bundle_id: str, cc: str, lang: str) -> str:
     return f"https://store.steampowered.com/bundle/{bundle_id}/?cc={cc}&l={lang}"
 
@@ -135,6 +149,75 @@ def fetch_html(url: str, timeout: int) -> str:
     )
     with urlopen(request, timeout=timeout) as response:
         return response.read().decode("utf-8", errors="ignore")
+
+
+def fetch_cbr_kzt_to_rub_rate(timeout: int) -> Decimal | None:
+    request = Request(
+        CBR_DAILY_RATES_URL,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = response.read()
+    except (HTTPError, URLError, TimeoutError):
+        return None
+
+    try:
+        root = ElementTree.fromstring(payload)
+    except ElementTree.ParseError:
+        return None
+
+    for valute in root.findall("Valute"):
+        char_code = valute.findtext("CharCode", default="").strip().upper()
+        if char_code != "KZT":
+            continue
+
+        nominal_text = valute.findtext("Nominal", default="").strip()
+        value_text = valute.findtext("Value", default="").strip().replace(",", ".")
+        try:
+            nominal = Decimal(nominal_text)
+            value = Decimal(value_text)
+        except InvalidOperation:
+            return None
+        if nominal == 0:
+            return None
+        return value / nominal
+
+    return None
+
+
+def extract_price_amount(price_text: str) -> Decimal | None:
+    match = re.search(r"\d[\d\s\u00a0\u202f.,']*", price_text)
+    if not match:
+        return None
+    numeric = match.group(0).replace(" ", "").replace("\u00a0", "").replace("\u202f", "").replace("'", "")
+    if "," in numeric and "." not in numeric:
+        numeric = numeric.replace(",", ".")
+    else:
+        numeric = numeric.replace(",", "")
+    try:
+        return Decimal(numeric)
+    except InvalidOperation:
+        return None
+
+
+def format_rub_amount(amount: Decimal) -> str:
+    rounded = amount.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return f"{int(rounded):,}".replace(",", " ") + " RUB"
+
+
+def convert_price_to_rub_text(price_text: str, kzt_to_rub_rate: Decimal | None) -> str | None:
+    if kzt_to_rub_rate is None or "₸" not in price_text:
+        return None
+    amount = extract_price_amount(price_text)
+    if amount is None:
+        return None
+    return format_rub_amount(amount * kzt_to_rub_rate)
 
 
 def extract_value_before_label(
@@ -357,6 +440,7 @@ def build_message(
     min_discount_percent: int,
     first_run: bool,
     force_notify: bool,
+    kzt_to_rub_rate: Decimal | None,
 ) -> str:
     if force_notify:
         header = "Проверка уведомлений Rusty Lake"
@@ -369,9 +453,15 @@ def build_message(
 
     lines = [f"<b>{escape(header)}</b>"]
     lines.append(f"Текущая цена: <b>{escape(current.current_price_text)}</b>")
+    current_rub = convert_price_to_rub_text(current.current_price_text, kzt_to_rub_rate)
+    if current_rub:
+        lines.append(f"В рублях: <b>{escape(current_rub)}</b>")
     lines.append(f"Скидка: <b>{current.discount_percent}%</b>")
     if current.original_price_text:
         lines.append(f"Обычная цена: {escape(current.original_price_text)}")
+        original_rub = convert_price_to_rub_text(current.original_price_text, kzt_to_rub_rate)
+        if original_rub:
+            lines.append(f"Обычная цена в рублях: {escape(original_rub)}")
     if changes:
         lines.append("")
         lines.append("Что изменилось:")
@@ -423,6 +513,9 @@ def run(force_notify: bool, send_test_message: bool) -> int:
     notify_on_any_change = parse_bool(env("NOTIFY_ON_ANY_CHANGE"), True)
     notify_on_first_run = parse_bool(env("NOTIFY_ON_FIRST_RUN"), False)
     notify_on_errors = parse_bool(env("NOTIFY_ON_ERRORS"), True)
+    kzt_to_rub_rate = fetch_cbr_kzt_to_rub_rate(timeout)
+    if kzt_to_rub_rate is None:
+        kzt_to_rub_rate = parse_decimal_env("KZT_TO_RUB_RATE")
 
     token = require_env("TELEGRAM_BOT_TOKEN")
     chat_id = require_env("TELEGRAM_CHAT_ID")
@@ -438,7 +531,7 @@ def run(force_notify: bool, send_test_message: bool) -> int:
             chat_id,
             (
                 "<b>Тест Telegram-бота</b>\n"
-                f"Бот для <b>{escape(bundle_name)}</b> на связи.\n"
+                f"Бот для <b>{escape(bundle_name)}</b> на проводе.\n"
                 f"<a href=\"{escape(store_url)}\">Страница Steam</a>"
             ),
             timeout,
@@ -484,6 +577,7 @@ def run(force_notify: bool, send_test_message: bool) -> int:
             min_discount_percent=min_discount_percent,
             first_run=first_run,
             force_notify=force_notify,
+            kzt_to_rub_rate=kzt_to_rub_rate,
         )
         send_telegram_message(token, chat_id, message, timeout)
         print("Telegram notification sent.")
