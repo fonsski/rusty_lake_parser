@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopenc
 
 
 DEFAULT_BUNDLE_ID = "3669"
@@ -165,6 +165,39 @@ def extract_first_price(lines: list[str]) -> str | None:
     return None
 
 
+def extract_purchase_offer(lines: list[str], bundle_name: str) -> tuple[str | None, int]:
+    heading_prefix = f"buy {bundle_name}".lower()
+    stop_markers = {
+        "about this bundle",
+        "items included in this bundle",
+        "package details",
+        "bundle details",
+    }
+
+    for index, line in enumerate(lines):
+        normalized_line = normalize_space(line).lower()
+        if not normalized_line.startswith(heading_prefix):
+            continue
+
+        prices: list[str] = []
+        discounts: list[int] = []
+        for candidate in lines[index + 1 :]:
+            normalized_candidate = normalize_space(candidate).lower()
+            if normalized_candidate in stop_markers:
+                break
+            price_match = PRICE_RE.search(candidate)
+            if price_match:
+                prices.append(normalize_space(price_match.group(0)))
+            discount_match = DISCOUNT_RE.search(candidate)
+            if discount_match:
+                discounts.append(parse_discount_percent(discount_match.group(0)))
+
+        if prices:
+            return prices[-1], max(discounts, default=0)
+
+    return None, 0
+
+
 def parse_discount_percent(value: str | None) -> int:
     if not value:
         return 0
@@ -179,7 +212,9 @@ def parse_bundle_snapshot(bundle_id: str, bundle_name: str, store_url: str, html
     extractor.feed(html)
     lines = extractor.lines()
 
-    current_price = extract_value_before_label(lines, "Your cost:", PRICE_RE)
+    current_price, purchase_discount = extract_purchase_offer(lines, bundle_name)
+    if current_price is None:
+        current_price = extract_value_before_label(lines, "Your cost:", PRICE_RE)
     original_price = extract_value_before_label(lines, "Price of individual products:", PRICE_RE)
     discount_text = extract_value_before_label(lines, "Bundle discount:", DISCOUNT_RE)
 
@@ -188,7 +223,7 @@ def parse_bundle_snapshot(bundle_id: str, bundle_name: str, store_url: str, html
     if current_price is None:
         raise ValueError("Failed to parse the current bundle price from Steam page.")
 
-    discount_percent = parse_discount_percent(discount_text)
+    discount_percent = max(purchase_discount, parse_discount_percent(discount_text))
 
     if original_price is None and discount_percent == 0:
         original_price = current_price
