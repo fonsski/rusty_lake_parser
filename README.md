@@ -118,4 +118,5 @@ python3 steam_rustylake_tracker.py --force-notify
 - `NOTIFY_ON_FIRST_RUN` - слать ли сообщение на самом первом запуске
 - `NOTIFY_ON_ERRORS` - слать ли ошибки в Telegram
 - `REQUEST_TIMEOUT` - таймаут HTTP-запросов
+- `FETCH_RETRIES` - сколько раз повторять запрос к Steam при временной сетевой ошибке
 - `STATE_FILE` - путь к JSON-файлу состояния

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ DEFAULT_BUNDLE_NAME = "Rusty Lake Bundle"
 DEFAULT_STEAM_CC = "us"
 DEFAULT_STEAM_LANG = "english"
 DEFAULT_TIMEOUT = 20
+DEFAULT_FETCH_RETRIES = 3
 DEFAULT_STATE_FILE = "data/rustylake_state.json"
 DEFAULT_MIN_DISCOUNT_PERCENT = 50
 CBR_DAILY_RATES_URL = "https://www.cbr.ru/scripts/XML_daily.asp"
@@ -136,7 +138,7 @@ def build_store_url(bundle_id: str, cc: str, lang: str) -> str:
     return f"https://store.steampowered.com/bundle/{bundle_id}/?cc={cc}&l={lang}"
 
 
-def fetch_html(url: str, timeout: int) -> str:
+def fetch_html(url: str, timeout: int, retries: int = DEFAULT_FETCH_RETRIES) -> str:
     request = Request(
         url,
         headers={
@@ -147,8 +149,19 @@ def fetch_html(url: str, timeout: int) -> str:
             "Pragma": "no-cache",
         },
     )
-    with urlopen(request, timeout=timeout) as response:
-        return response.read().decode("utf-8", errors="ignore")
+    last_error: Exception | None = None
+    for attempt in range(max(retries, 1)):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                return response.read().decode("utf-8", errors="ignore")
+        except (URLError, TimeoutError) as exc:
+            last_error = exc
+            if attempt + 1 >= max(retries, 1):
+                break
+            time.sleep(min(2 * (attempt + 1), 5))
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Failed to fetch Steam page without a captured network error.")
 
 
 def fetch_cbr_kzt_to_rub_rate(timeout: int) -> Decimal | None:
@@ -505,6 +518,7 @@ def run(force_notify: bool, send_test_message: bool) -> int:
     steam_cc = env("STEAM_CC", DEFAULT_STEAM_CC) or DEFAULT_STEAM_CC
     steam_lang = env("STEAM_LANG", DEFAULT_STEAM_LANG) or DEFAULT_STEAM_LANG
     timeout = int(env("REQUEST_TIMEOUT", str(DEFAULT_TIMEOUT)) or DEFAULT_TIMEOUT)
+    fetch_retries = int(env("FETCH_RETRIES", str(DEFAULT_FETCH_RETRIES)) or DEFAULT_FETCH_RETRIES)
     state_path = Path(env("STATE_FILE", DEFAULT_STATE_FILE) or DEFAULT_STATE_FILE)
     min_discount_percent = int(
         env("MIN_DISCOUNT_PERCENT", str(DEFAULT_MIN_DISCOUNT_PERCENT))
@@ -540,7 +554,7 @@ def run(force_notify: bool, send_test_message: bool) -> int:
         return 0
 
     try:
-        html = fetch_html(parse_store_url, timeout)
+        html = fetch_html(parse_store_url, timeout, retries=fetch_retries)
         current = parse_bundle_snapshot(bundle_id, bundle_name, store_url, html)
     except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
         error_text = f"{type(exc).__name__}: {exc}"
